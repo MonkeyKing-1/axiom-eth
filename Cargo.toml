@@ -18,6 +18,7 @@ lazy_static = "1.4.0"
 serde = { version = "1.0", default-features = false, features = ["derive"] }
 serde_json = { version = "1.0", default-features = false }
 rayon = "1.7"
+hasher = { version = "0.1", features = ["hash-keccak"] }
 
 # misc
 log = "0.4"
@@ -40,6 +41,9 @@ ethers-core = { version = "=2.0.6" } # used by halo2-mpt already
 rand_core = { version = "0.6", default-features = false, features = ["getrandom"] }
 rand = "0.8"
 rand_chacha = "0.3.1"
+
+# mpt implementation
+cita_trie = { git = "https://github.com/citahub/cita-trie", branch = "master" }
 
 # aggregation 
 snark-verifier = { git = "https://github.com/axiom-crypto/snark-verifier.git", branch = "community-edition", default-features = false, features = ["loader_halo2"], optional = true }

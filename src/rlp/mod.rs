@@ -90,6 +90,16 @@ pub struct RlpArrayPrefixParsed<F: ScalarField> {
 }
 
 #[derive(Clone, Debug)]
+pub struct RlpComboPrefixParsed<F: ScalarField> {
+    is_not_literal: AssignedValue<F>,
+    is_field: AssignedValue<F>,
+    is_big: AssignedValue<F>,
+
+    next_len: AssignedValue<F>,
+    len_len: AssignedValue<F>,
+}
+
+#[derive(Clone, Debug)]
 pub struct RlpFieldWitness<F: ScalarField> {
     prefix: AssignedValue<F>, // value of the prefix
     prefix_len: AssignedValue<F>,
@@ -271,6 +281,40 @@ impl<'range, F: ScalarField> RlpChip<'range, F> {
         RlpArrayPrefixParsed { is_big, next_len, len_len }
     }
 
+    pub fn parse_rlp_combo_prefix(
+        &self,
+        ctx: &mut Context<F>,
+        prefix: AssignedValue<F>,
+    ) -> RlpComboPrefixParsed<F> {
+        self.range.check_less_than(ctx, prefix, Constant(self.field_element(256)), 9);
+        let is_not_literal =
+            self.range.is_less_than(ctx, Constant(self.field_element(127)), prefix, 8);
+        let is_field = self.range.is_less_than(ctx, prefix, Constant(self.field_element(192)), 8);
+
+        let is_big_if_field =
+            self.range.is_less_than(ctx, Constant(self.field_element(183)), prefix, 8);
+        let is_big_if_array =
+            self.range.is_less_than(ctx, Constant(self.field_element(247)), prefix, 8);
+
+        let is_big = self.gate().select(ctx, is_big_if_field, is_big_if_array, is_field);
+
+        let field_len = self.gate().sub(ctx, prefix, Constant(self.field_element(128)));
+        let field_len_len = self.gate().sub(ctx, prefix, Constant(self.field_element(183)));
+        let next_field_len = self.gate().select(ctx, field_len_len, field_len, is_big_if_field);
+        let next_field_len =
+            self.gate().select(ctx, next_field_len, Constant(F::one()), is_not_literal);
+
+        let array_len = self.gate().sub(ctx, prefix, Constant(self.field_element(192)));
+        let array_len_len = self.gate().sub(ctx, prefix, Constant(self.field_element(247)));
+        let next_array_len = self.gate().select(ctx, array_len_len, array_len, is_big_if_array);
+
+        let next_len = self.gate().select(ctx, next_field_len, next_array_len, is_field);
+        let len_len = self.gate().select(ctx, field_len_len, array_len_len, is_field);
+        let len_len = self.gate().mul(ctx, len_len, is_big);
+
+        RlpComboPrefixParsed { is_not_literal, is_field, is_big, next_len, len_len }
+    }
+
     /// Given a full RLP encoding `rlp_cells` string, and the length in bytes of the length of the payload, `len_len`, parse the length of the payload.
     ///
     /// Assumes that it is known that `len_len <= max_len_len`.
@@ -424,6 +468,7 @@ impl<'range, F: ScalarField> RlpChip<'range, F> {
         rlp_array: Vec<AssignedValue<F>>,
         max_field_lens: &[usize],
         is_variable_len: bool,
+        is_combo: bool,
     ) -> RlpArrayTraceWitness<F> {
         let max_rlp_array_len = rlp_array.len();
         let max_len_len = max_rlp_len_len(max_rlp_array_len);
@@ -450,15 +495,28 @@ impl<'range, F: ScalarField> RlpChip<'range, F> {
         //                        (field_rlc.rlc_val, field_rlc.rlc_len)])
 
         let prefix = rlp_array[0];
-        let prefix_parsed = self.parse_rlp_array_prefix(ctx, prefix);
 
-        let len_len = prefix_parsed.len_len;
+        let len_len: AssignedValue<F>;
+        let next_len: AssignedValue<F>;
+        let is_big: AssignedValue<F>;
+
+        if is_combo {
+            let prefix_parsed = self.parse_rlp_combo_prefix(ctx, prefix);
+            len_len = prefix_parsed.len_len;
+            next_len = prefix_parsed.next_len;
+            is_big = prefix_parsed.is_big;
+        } else {
+            let prefix_parsed = self.parse_rlp_array_prefix(ctx, prefix);
+            len_len = prefix_parsed.len_len;
+            next_len = prefix_parsed.next_len;
+            is_big = prefix_parsed.is_big;
+        }
+
         self.range.check_less_than_safe(ctx, len_len, (max_len_len + 1) as u64);
 
         let (len_cells, len_byte_val) = self.parse_rlp_len(ctx, &rlp_array, len_len, max_len_len);
 
-        let list_payload_len =
-            self.gate().select(ctx, len_byte_val, prefix_parsed.next_len, prefix_parsed.is_big);
+        let list_payload_len = self.gate().select(ctx, len_byte_val, next_len, is_big);
         self.range.check_less_than_safe(
             ctx,
             list_payload_len,
@@ -482,13 +540,30 @@ impl<'range, F: ScalarField> RlpChip<'range, F> {
                 rlp_array.iter().copied().take(running_max_len + 1),
                 prefix_idx,
             );
-            let prefix_parsed = self.parse_rlp_field_prefix(ctx, prefix);
 
-            let mut len_len = prefix_parsed.len_len;
+            let mut len_len: AssignedValue<F>;
+            let next_len: AssignedValue<F>;
+            let is_big: AssignedValue<F>;
+            let is_not_literal: AssignedValue<F>;
+
+            if is_combo {
+                let prefix_parsed = self.parse_rlp_combo_prefix(ctx, prefix);
+                len_len = prefix_parsed.len_len;
+                next_len = prefix_parsed.next_len;
+                is_big = prefix_parsed.is_big;
+                is_not_literal = prefix_parsed.is_not_literal;
+            } else {
+                let prefix_parsed = self.parse_rlp_field_prefix(ctx, prefix);
+                len_len = prefix_parsed.len_len;
+                next_len = prefix_parsed.next_len;
+                is_big = prefix_parsed.is_big;
+                is_not_literal = prefix_parsed.is_not_literal;
+            }
+
             let max_field_len_len = max_rlp_len_len(max_field_len);
             self.range.check_less_than_safe(ctx, len_len, (max_field_len_len + 1) as u64);
 
-            let len_start_id = *prefix_parsed.is_not_literal.value() + prefix_idx.value();
+            let len_start_id = *is_not_literal.value() + prefix_idx.value();
             let len_cells = witness_subarray(
                 ctx,
                 &rlp_array,
@@ -498,12 +573,7 @@ impl<'range, F: ScalarField> RlpChip<'range, F> {
             );
 
             let field_byte_val = evaluate_byte_array(ctx, self.gate(), &len_cells, len_len);
-            let mut field_len = self.gate().select(
-                ctx,
-                field_byte_val,
-                prefix_parsed.next_len,
-                prefix_parsed.is_big,
-            );
+            let mut field_len = self.gate().select(ctx, field_byte_val, next_len, is_big);
             self.range.check_less_than_safe(ctx, field_len, (max_field_len + 1) as u64);
 
             let field_cells = witness_subarray(
@@ -516,7 +586,7 @@ impl<'range, F: ScalarField> RlpChip<'range, F> {
             running_max_len += 1 + max_field_len_len + max_field_len;
 
             // prefix_len is either 0 or 1
-            let mut prefix_len = prefix_parsed.is_not_literal;
+            let mut prefix_len = is_not_literal;
             if is_variable_len {
                 // If `prefix_idx >= rlp_len`, that means we are done
                 let field_in_list = self.range.is_less_than(

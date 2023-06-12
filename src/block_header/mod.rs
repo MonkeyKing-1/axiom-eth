@@ -225,7 +225,7 @@ impl<'chip, F: Field> EthBlockHeaderChip<F> for EthChip<'chip, F> {
         let block_header_assigned =
             ctx.assign_witnesses(block_header.iter().map(|byte| F::from(*byte as u64)));
         let rlp_witness =
-            self.rlp().decompose_rlp_array_phase0(ctx, block_header_assigned, max_field_lens, true); // `is_variable_len = true` because RLP can have between 15 to 17 fields, depending on which EIPs are active at that block
+            self.rlp().decompose_rlp_array_phase0(ctx, block_header_assigned, max_field_lens, true, false); // `is_variable_len = true` because RLP can have between 15 to 17 fields, depending on which EIPs are active at that block
 
         let block_hash_query_idx = keccak.keccak_var_len(
             ctx,
@@ -298,7 +298,7 @@ impl<'chip, F: Field> EthBlockHeaderChip<F> for EthChip<'chip, F> {
                 let mut ctx = Context::new(witness_gen_only, ctx_id);
                 let header = ctx.assign_witnesses(header.iter().map(|byte| F::from(*byte as u64)));
                 let rlp_witness =
-                    self.rlp().decompose_rlp_array_phase0(&mut ctx, header, max_field_lens, true); // `is_variable_len = true` because RLP can have either 15 or 16 fields, depending on whether block is pre-London or not
+                    self.rlp().decompose_rlp_array_phase0(&mut ctx, header, max_field_lens, true, false); // `is_variable_len = true` because RLP can have either 15 or 16 fields, depending on whether block is pre-London or not
                 (rlp_witness, ctx)
             })
             .unzip();

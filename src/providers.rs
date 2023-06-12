@@ -4,7 +4,7 @@ use crate::{
         EthBlockHeaderChainInstance, GOERLI_BLOCK_HEADER_RLP_MAX_BYTES,
         MAINNET_BLOCK_HEADER_RLP_MAX_BYTES,
     },
-    mpt::MPTFixedKeyInput,
+    mpt::{MPTKeyInput, PathType},
     storage::{EthBlockStorageInput, EthStorageInput},
     util::{get_merkle_mountain_range, u256_to_bytes32_be},
     Network,
@@ -56,14 +56,16 @@ pub fn get_block_storage_input(
 
     let acct_key = H256(keccak256(addr));
     let slot_is_empty = !is_assigned_slot(&acct_key, &pf.account_proof);
-    let acct_pf = MPTFixedKeyInput {
-        path: acct_key,
+    let acct_pf = MPTKeyInput {
+        path: PathType::Fixed(acct_key),
         value: get_acct_rlp(&pf),
         root_hash: block.state_root,
         proof: pf.account_proof.into_iter().map(|x| x.to_vec()).collect(),
         value_max_byte_len: ACCOUNT_PROOF_VALUE_MAX_BYTE_LEN,
         max_depth: acct_pf_max_depth,
         slot_is_empty,
+        max_key_byte_len : 32,
+        key_byte_len : Some(32),
     };
 
     let storage_pfs = pf
@@ -77,14 +79,16 @@ pub fn get_block_storage_input(
             (
                 storage_pf.key,
                 storage_pf.value,
-                MPTFixedKeyInput {
-                    path,
+                MPTKeyInput {
+                    path: PathType::Fixed(path),
                     value,
                     root_hash: pf.storage_hash,
                     proof: storage_pf.proof.into_iter().map(|x| x.to_vec()).collect(),
                     value_max_byte_len: STORAGE_PROOF_VALUE_MAX_BYTE_LEN,
                     max_depth: storage_pf_max_depth,
                     slot_is_empty,
+                    max_key_byte_len : 32,
+                    key_byte_len : Some(32),
                 },
             )
         })

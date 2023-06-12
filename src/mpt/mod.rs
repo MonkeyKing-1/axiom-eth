@@ -14,6 +14,7 @@ use crate::{
     rlp::{rlc::RlcChip, RlpArrayTraceWitness},
     Field,
 };
+use ark_std::log2;
 use ethers_core::{types::H256, utils::hex::FromHex};
 use halo2_base::{
     gates::{GateChip, GateInstructions, RangeChip, RangeInstructions},
@@ -134,9 +135,9 @@ pub struct MPTKeyFragment<F: Field> {
 }
 
 #[derive(Clone, Debug)]
-pub struct MPTFixedKeyProof<F: Field> {
+pub struct MPTKeyProof<F: Field> {
     // claim specification: (key, value)
-    /// The key bytes, fixed length
+    /// The key bytes
     pub key_bytes: AssignedBytes<F>,
     /// The RLP encoded `value` as bytes, variable length, resized to `value_max_byte_len`
     pub value_bytes: AssignedBytes<F>,
@@ -144,6 +145,8 @@ pub struct MPTFixedKeyProof<F: Field> {
     pub root_hash_bytes: AssignedBytes<F>,
 
     // proof specification
+    /// The variable length of the key
+    pub key_byte_len: Option<AssignedValue<F>>,
     /// The variable length of the proof, including the leaf node if !slot_is_empty.
     pub depth: AssignedValue<F>,
     /// RLP encoding of the final leaf node
@@ -157,19 +160,21 @@ pub struct MPTFixedKeyProof<F: Field> {
     /// Boolean indicating whether the MPT contains a value at `key`
     pub slot_is_empty: AssignedValue<F>,
 
-    // pub key_byte_len: usize,
-    // pub value_max_byte_len: usize,
+    /// The maximum byte length of the key
+    pub max_key_byte_len: usize,
     /// `max_depth` should be `>=1`
     pub max_depth: usize,
 }
 
 #[derive(Clone, Debug)]
-pub struct MPTFixedKeyProofWitness<F: Field> {
+pub struct MPTKeyProofWitness<F: Field> {
     // pub proof: MPTFixedKeyProof<F>,
     // we keep only the parts of the proof necessary:
     pub value_bytes: AssignedBytes<F>,
     pub value_byte_len: AssignedValue<F>,
     pub root_hash_bytes: AssignedBytes<F>,
+    /// The variable length of the key
+    pub key_byte_len: Option<AssignedValue<F>>,
     /// The variable length of the proof. This includes the leaf node in the case of an inclusion proof. There is no leaf node in the case of a non-inclusion proof.
     pub depth: AssignedValue<F>,
     /// The non-leaf nodes of the mpt proof, resized to `max_depth - 1`. Each node has been parsed with both a hypothetical branch and extension node. The actual type is determined by the `node_type` flag.
@@ -182,7 +187,7 @@ pub struct MPTFixedKeyProofWitness<F: Field> {
     /// Boolean indicating whether the MPT contains a value at `key`
     pub slot_is_empty: AssignedValue<F>,
 
-    pub key_byte_len: usize,
+    pub max_key_byte_len: usize,
     pub max_depth: usize,
 
     /// The key fragments (nibbles), without encoding, provided as private inputs
@@ -197,7 +202,7 @@ pub struct MPTFixedKeyProofWitness<F: Field> {
     pub key_hexs: AssignedNibbles<F>,
 }
 
-impl<F: Field> MPTFixedKeyProofWitness<F> {
+impl<F: Field> MPTKeyProofWitness<F> {
     /// Shifts all keccak query indices by `shift`. This is necessary when
     /// joining parallel (multi-threaded) keccak chips into one.
     ///
@@ -211,15 +216,25 @@ impl<F: Field> MPTFixedKeyProofWitness<F> {
     }
 }
 
+
+#[derive(Clone, Debug)]
+pub enum PathType {
+    /// The path is variable length
+    Var(Vec<u8>),
+    /// The path is fixed
+    Fixed(H256),
+}
+
+
 #[derive(Clone, Debug)]
 /// The pre-assigned inputs for the MPT fixed key proof
-pub struct MPTFixedKeyInput {
+pub struct MPTKeyInput {
     // claim specification: (path, value)
     /// A Merkle-Patricia Trie is a mapping `path => value`
     ///
     /// As an example, the MPT state trie of Ethereum has
     /// `path = keccak256(address) => value = rlp(account)`
-    pub path: H256,
+    pub path: PathType,
     pub value: Vec<u8>,
     pub root_hash: H256,
 
@@ -229,7 +244,30 @@ pub struct MPTFixedKeyInput {
 
     pub value_max_byte_len: usize,
     pub max_depth: usize,
+    pub max_key_byte_len: usize,
+    pub key_byte_len: Option<usize>,
 }
+
+
+// pub struct MPTVarKeyInput {
+//     // claim specification: (path, value)
+//     /// A Merkle-Patricia Trie is a mapping `path => value`
+//     ///
+//     /// As an example, the MPT state trie of Ethereum has
+//     /// `path = keccak256(address) => value = rlp(account)`
+//     pub path: Vec<u8>,
+//     pub value: Vec<u8>,
+//     pub root_hash: H256,
+
+//     pub proof: Vec<Vec<u8>>,
+
+//     pub slot_is_empty: bool,
+
+//     pub value_max_byte_len: usize,
+//     pub max_depth: usize,
+//     pub max_key_byte_len: usize,
+//     pub key_byte_len: Option<usize>,
+// }
 
 /* // TODO
 #[derive(Clone, Debug)]
@@ -399,9 +437,8 @@ impl<'chip, F: Field> EthChip<'chip, F> {
     ) -> LeafTraceWitness<F> {
         let (max_field_bytes, max_leaf_bytes) = max_leaf_lens(max_key_bytes, max_value_bytes);
         assert_eq!(leaf_bytes.len(), max_leaf_bytes);
-
         let rlp_witness =
-            self.rlp.decompose_rlp_array_phase0(ctx, leaf_bytes, &max_field_bytes, false);
+            self.rlp.decompose_rlp_array_phase0(ctx, leaf_bytes, &max_field_bytes, false, true);
         // TODO: remove unnecessary clones somehow?
         let hash_query_idx =
             self.mpt_hash_phase0(ctx, keccak, rlp_witness.rlp_array.clone(), rlp_witness.rlp_len);
@@ -437,7 +474,7 @@ impl<'chip, F: Field> EthChip<'chip, F> {
         debug_assert_eq!(ext_bytes.len(), max_ext_bytes);
 
         let rlp_witness =
-            self.rlp.decompose_rlp_array_phase0(ctx, ext_bytes, &max_field_bytes, false);
+            self.rlp.decompose_rlp_array_phase0(ctx, ext_bytes, &max_field_bytes, false, true);
         let hash_query_idx =
             self.mpt_hash_phase0(ctx, keccak, rlp_witness.rlp_array.clone(), rlp_witness.rlp_len);
         ExtensionTraceWitness { rlp: rlp_witness, hash_query_idx }
@@ -473,7 +510,7 @@ impl<'chip, F: Field> EthChip<'chip, F> {
         assert_eq!(branch_bytes.len(), max_branch_bytes);
 
         let rlp_witness =
-            self.rlp.decompose_rlp_array_phase0(ctx, branch_bytes, max_field_bytes, false);
+            self.rlp.decompose_rlp_array_phase0(ctx, branch_bytes, max_field_bytes, false, true);
         let hash_query_idx =
             self.mpt_hash_phase0(ctx, keccak, rlp_witness.rlp_array.clone(), rlp_witness.rlp_len);
         BranchTraceWitness { rlp: rlp_witness, hash_query_idx }
@@ -504,15 +541,16 @@ impl<'chip, F: Field> EthChip<'chip, F> {
         &self,
         ctx: &mut Context<F>,
         keccak: &mut KeccakChip<F>,
-        proof: MPTFixedKeyProof<F>,
-    ) -> MPTFixedKeyProofWitness<F> {
-        let key_byte_len = proof.key_bytes.len();
+        proof: MPTKeyProof<F>,
+    ) -> MPTKeyProofWitness<F> {
+        let max_key_byte_len = proof.max_key_byte_len;
         let value_max_byte_len = proof.value_bytes.len();
         let max_depth = proof.max_depth;
         assert_eq!(proof.nodes.len(), max_depth - 1);
         assert_eq!(proof.root_hash_bytes.len(), 32);
+        assert_eq!(proof.key_bytes.len(), proof.max_key_byte_len);
 
-        let ext_max_byte_len = Self::ext_max_byte_len(key_byte_len);
+        let ext_max_byte_len = Self::ext_max_byte_len(proof.max_key_byte_len);
         let branch_max_byte_len = MAX_BRANCH_LENS.1;
         let node_max_byte_len = max(ext_max_byte_len, branch_max_byte_len);
 
@@ -555,9 +593,22 @@ impl<'chip, F: Field> EthChip<'chip, F> {
         }
         self.range().check_less_than_safe(ctx, proof.depth, max_depth as u64 + 1);
         self.range().check_less_than_safe(ctx, proof.value_byte_len, value_max_byte_len as u64 + 1);
-        for frag_len in proof.key_frag.iter().map(|frag| frag.byte_len) {
-            self.range().check_less_than_safe(ctx, frag_len, key_byte_len as u64 + 2);
+        match proof.key_byte_len {
+            Some(key_byte_len) => {
+                self.range().check_less_than_safe(ctx, key_byte_len, max_key_byte_len as u64 + 1);
+                let two = ctx.load_constant(F::from(2u64));
+                let frag_ub = self.gate().add(ctx, two, key_byte_len);
+                for frag_len in proof.key_frag.iter().map(|frag| frag.byte_len) {
+                    self.range().check_less_than(ctx, frag_len, frag_ub, (log2(max_key_byte_len) + 1).try_into().unwrap());
+                }
+            }
+            None => {
+                for frag_len in proof.key_frag.iter().map(|frag| frag.byte_len) {
+                    self.range().check_less_than_safe(ctx, frag_len, max_key_byte_len as u64 + 2);
+                }
+            }
         }
+        
 
         /* Parse RLP
          * RLP Leaf      for leaf_bytes
@@ -565,7 +616,7 @@ impl<'chip, F: Field> EthChip<'chip, F> {
          * RLP Branch    for select(nodes[idx], dummy_branch[idx], node_types[idx])
          */
         let leaf_parsed =
-            self.parse_leaf_phase0(ctx, keccak, proof.leaf_bytes, key_byte_len, value_max_byte_len);
+            self.parse_leaf_phase0(ctx, keccak, proof.leaf_bytes, max_key_byte_len, value_max_byte_len);
 
         let nodes: Vec<_> = proof
             .nodes
@@ -585,9 +636,9 @@ impl<'chip, F: Field> EthChip<'chip, F> {
                     })
                     .unzip();
 
-                let ext_parsed = self.parse_ext_phase0(ctx, keccak, ext_in, key_byte_len);
+                let ext_parsed = self.parse_ext_phase0(ctx, keccak, ext_in, max_key_byte_len);
                 let branch_parsed =
-                    self.parse_nonterminal_branch_phase0(ctx, keccak, branch_in, key_byte_len);
+                    self.parse_nonterminal_branch_phase0(ctx, keccak, branch_in, max_key_byte_len);
                 MPTNodeWitness { node_type: node.node_type, ext: ext_parsed, branch: branch_parsed }
             })
             .collect();
@@ -599,13 +650,13 @@ impl<'chip, F: Field> EthChip<'chip, F> {
         // assert to avoid capacity checks?
         assert_eq!(proof.key_frag.len(), max_depth);
         for (idx, key_frag) in proof.key_frag.iter().enumerate() {
-            debug_assert_eq!(key_frag.nibbles.len(), 2 * key_byte_len);
+            debug_assert_eq!(key_frag.nibbles.len(), 2 * max_key_byte_len);
             let leaf_path_bytes = hex_prefix_encode(
                 ctx,
                 self.gate(),
                 &key_frag.nibbles,
                 key_frag.is_odd,
-                key_byte_len,
+                max_key_byte_len,
                 false,
             );
             if idx < max_depth - 1 {
@@ -626,7 +677,7 @@ impl<'chip, F: Field> EthChip<'chip, F> {
             frag_lens.push(frag_len);
         }
 
-        let mut key_hexs = Vec::with_capacity(2 * key_byte_len);
+        let mut key_hexs = Vec::with_capacity(2 * max_key_byte_len);
         for byte in proof.key_bytes.into_iter() {
             let bits = self.gate().num_to_bits(ctx, byte, 8);
             let hexs = [4, 0].map(|i| {
@@ -639,28 +690,29 @@ impl<'chip, F: Field> EthChip<'chip, F> {
             key_hexs.extend(hexs);
         }
 
-        MPTFixedKeyProofWitness {
+        MPTKeyProofWitness {
             value_bytes: proof.value_bytes,
             value_byte_len: proof.value_byte_len,
             root_hash_bytes: proof.root_hash_bytes,
+            key_byte_len: proof.key_byte_len,
             depth: proof.depth,
             nodes,
-            key_frag: proof.key_frag,
-            key_byte_len,
-            max_depth,
             leaf_parsed,
+            slot_is_empty: proof.slot_is_empty,
+            max_key_byte_len,
+            max_depth,
+            key_frag: proof.key_frag,
             key_frag_ext_bytes,
             key_frag_leaf_bytes,
-            key_hexs,
             frag_lens,
-            slot_is_empty: proof.slot_is_empty,
+            key_hexs,
         }
     }
 
     pub fn parse_mpt_inclusion_fixed_key_phase1(
         &self,
         (ctx_gate, ctx_rlc): RlcContextPair<F>,
-        mut witness: MPTFixedKeyProofWitness<F>,
+        mut witness: MPTKeyProofWitness<F>,
     ) {
         let max_depth = witness.max_depth;
         let leaf_parsed = self.parse_leaf_phase1((ctx_gate, ctx_rlc), witness.leaf_parsed);
@@ -763,8 +815,32 @@ impl<'chip, F: Field> EthChip<'chip, F> {
 
         // Check key fragments concatenate to key using hex RLC
         // We supply witness key fragments so this check passes even if the slot is empty
+        // let key_hex_len = match witness.key_byte_len {
+        //     Some(key_byte_len) => { 
+        //         self.gate().add(ctx_gate, key_byte_len, key_byte_len);
+        //     }
+        //     None => {
+        //         witness.max_key_byte_len;
+        //     } 
+        // };
         let fragment_first_nibbles = {
-            let key_hex_rlc = self.rlc().compute_rlc_fixed_len(ctx_rlc, key_hexs);
+            let (key_hex_rlc, key_hex_rlc_fixed) = match witness.key_byte_len {
+                Some(key_byte_len) => {
+                    let key_hex_len = self.gate().add(ctx_gate, key_byte_len, key_byte_len);
+                    (Some(self.rlc().compute_rlc((ctx_gate, ctx_rlc), self.gate(), key_hexs, key_hex_len)), None)
+                }
+                None => {
+                    (None, Some(self.rlc().compute_rlc_fixed_len(ctx_rlc, key_hexs)))
+                }
+            };
+            // let key_hex_rlc_fixed = match witness.key_byte_len{
+            //     Some(key_byte_len) => {
+            //         None
+            //     }
+            //     None => {
+            //         Some(self.rlc().compute_rlc_fixed_len(ctx_rlc, key_hexs))
+            //     }
+            // };
             let (fragment_rlcs, fragment_first_nibbles): (Vec<_>, Vec<_>) = witness
                 .key_frag
                 .into_iter()
@@ -782,26 +858,79 @@ impl<'chip, F: Field> EthChip<'chip, F> {
                     )
                 })
                 .unzip();
-
             self.rlc().load_rlc_cache(
                 (ctx_gate, ctx_rlc),
                 self.gate(),
-                bit_length(2 * witness.key_byte_len as u64),
+                bit_length(2 * witness.max_key_byte_len as u64),
             );
-            let key_len =
-                ctx_gate.load_constant(self.gate().get_field_element(key_hex_rlc.len as u64));
-
-            self.rlc().constrain_rlc_concat_var(
-                ctx_gate,
-                self.gate(),
-                fragment_rlcs.into_iter().map(|f| (f.rlc_val, f.len, f.max_len)),
-                (&key_hex_rlc.rlc_val, &key_len),
-                witness.depth,
-            );
+            let key_len = match witness.key_byte_len {
+                Some(_key_byte_len) => {
+                    match key_hex_rlc {
+                        Some(key_hex_rlc) => {
+                            key_hex_rlc.len
+                        }
+                        None => {
+                            assert!(false);
+                            ctx_gate.load_witness(F::from(0))
+                        }
+                    }
+                }
+                None => {
+                    match key_hex_rlc_fixed {
+                        None => {
+                            assert!(false);
+                            ctx_gate.load_constant(F::from(0))
+                        }
+                        Some(key_hex_rlc_fixed) => {
+                            ctx_gate.load_constant(self.gate().get_field_element(key_hex_rlc_fixed.len as u64))
+                        }
+                    }
+                }
+            };
+            
+            match witness.key_byte_len {
+                Some(_key_byte_len) => {
+                    match key_hex_rlc {
+                        Some(key_hex_rlc) => {
+                            self.rlc().constrain_rlc_concat_var(
+                                ctx_gate,
+                                self.gate(),
+                                fragment_rlcs.into_iter().map(|f| (f.rlc_val, f.len, f.max_len)),
+                                (&key_hex_rlc.rlc_val, &key_len),
+                                witness.depth,
+                            );
+                        }
+                        None => {
+                            // Should never reach here
+                            assert!(false);
+                        }
+                    }
+                }
+                None => {
+                    match key_hex_rlc_fixed {
+                        None => {
+                            // Should never reach here
+                            assert!(false);
+                        }
+                        Some(key_hex_rlc_fixed) => {
+                            self.rlc().constrain_rlc_concat_var(
+                                ctx_gate,
+                                self.gate(),
+                                fragment_rlcs.into_iter().map(|f| (f.rlc_val, f.len, f.max_len)),
+                                (&key_hex_rlc_fixed.rlc_val, &key_len),
+                                witness.depth,
+                            );
+                        }
+                    }
+                }
+            }
+            
 
             fragment_first_nibbles
         };
-
+        // let three_wit = ctx_gate.load_witness(F::from(3));
+        //     let four_wit = ctx_gate.load_witness(F::from(4));
+        //     ctx_gate.constrain_equal(&three_wit, &four_wit);
         /* Check value matches. Currently value_bytes is RLC encoded
          * and value_byte_len is the RLC encoding's length
          */
@@ -913,6 +1042,8 @@ impl<'chip, F: Field> EthChip<'chip, F> {
             }
         }
         // constrain hash chain
+        
+
         {
             let match_sums =
                 self.gate().partial_sums(ctx_gate, matches.iter().copied()).collect_vec();
@@ -923,13 +1054,17 @@ impl<'chip, F: Field> EthChip<'chip, F> {
             );
             ctx_gate.constrain_equal(&match_cnt, &depth_minus_one);
         }
+        
         // if slot_is_empty: check that nodes[depth - 1] points to null if it is branch node
         {
             let mut branch_ref_check = self.gate().select_by_indicator(
                 ctx_gate,
-                branch_refs_are_null.into_iter().map(Existing),
-                depth_minus_one_indicator,
+                branch_refs_are_null.clone().into_iter().map(Existing),
+                depth_minus_one_indicator.clone(),
             );
+            println!("BRANCH_REFS_ARE_NULL{:?}", branch_refs_are_null);
+            println!("DEPTH_MINUS_ONE_INDICATOR{:?}", depth_minus_one_indicator);
+
             branch_ref_check =
                 self.gate().select(ctx_gate, branch_ref_check, Constant(F::one()), slot_is_empty);
             // nothing to check if proof is empty
@@ -1053,8 +1188,8 @@ pub fn hex_prefix_len<F: ScalarField>(
     gate.select(ctx, Constant(F::zero()), hex_len, byte_len_is_zero)
 }
 
-impl MPTFixedKeyInput {
-    pub fn assign<F: Field>(self, ctx: &mut Context<F>) -> MPTFixedKeyProof<F> {
+impl MPTKeyInput {
+    pub fn assign<F: Field>(self, ctx: &mut Context<F>) -> MPTKeyProof<F> {
         let Self {
             path,
             mut value,
@@ -1063,9 +1198,11 @@ impl MPTFixedKeyInput {
             value_max_byte_len,
             max_depth,
             slot_is_empty,
+            max_key_byte_len,
+            key_byte_len,
         } = self;
         let depth = proof.len();
-        let key_byte_len = 32;
+        let max_key_byte_len = max_key_byte_len;
         //assert!(depth <= max_depth - usize::from(slot_is_empty));
 
         let bytes_to_nibbles = |bytes: &[u8]| {
@@ -1077,16 +1214,18 @@ impl MPTFixedKeyInput {
             nibbles
         };
         let hex_len = |byte_len: usize, is_odd: bool| 2 * byte_len + usize::from(is_odd) - 2;
-
-        let path_nibbles = bytes_to_nibbles(path.as_bytes());
+        let path_nibbles = match &path {
+            PathType::Fixed(fpath) => bytes_to_nibbles(fpath.as_bytes()),
+            PathType::Var(vpath) => bytes_to_nibbles(&vpath)
+        };
         let mut path_idx = 0;
 
         // below "key" and "path" are used interchangeably, sorry for confusion
         // if slot_is_empty, leaf is dummy, but with value 0x0 to make constraints pass (assuming claimed value is also 0x0)
         let mut leaf = if slot_is_empty { NULL_LEAF.clone() } else { proof.pop().unwrap() };
-        let (_, max_leaf_bytes) = max_leaf_lens(key_byte_len, value_max_byte_len);
+        let (_, max_leaf_bytes) = max_leaf_lens(max_key_byte_len, value_max_byte_len);
 
-        let (_, max_ext_bytes) = max_ext_lens(key_byte_len);
+        let (_, max_ext_bytes) = max_ext_lens(max_key_byte_len);
         let max_branch_bytes = MAX_BRANCH_LENS.1;
         let max_node_bytes = max(max_ext_bytes, max_branch_bytes);
 
@@ -1102,10 +1241,10 @@ impl MPTFixedKeyInput {
                 let is_odd = encoded_nibbles[0] == 1u8 || encoded_nibbles[0] == 3u8;
                 let mut frag = encoded_nibbles[2 - usize::from(is_odd)..].to_vec();
                 path_idx += frag.len();
-                frag.resize(2 * key_byte_len, 0);
+                frag.resize(2 * max_key_byte_len, 0);
                 key_frag.push((frag, byte_len, is_odd));
             } else {
-                let mut frag = vec![0u8; 2 * key_byte_len];
+                let mut frag = vec![0u8; 2 * max_key_byte_len];
                 frag[0] = path_nibbles[path_idx];
                 key_frag.push((frag, 1, true));
                 path_idx += 1;
@@ -1123,14 +1262,39 @@ impl MPTFixedKeyInput {
 
         process_node(&leaf);
         leaf.resize(max_leaf_bytes, 0);
+        let mut path_bytes = match &path {
+            PathType::Fixed(fpath) => fpath.as_bytes().to_vec(),
+            PathType::Var(vpath) => vpath.clone()
+        };
+        match key_byte_len {
+            Some(key_byte_len) => {
+                assert!(key_byte_len <= max_key_byte_len);
+                assert!(key_byte_len == path_bytes.len());
+                let key_byte_len_wit = ctx.load_witness(F::from(key_byte_len as u64));
+                let path_byte_len_wit = ctx.load_witness(F::from(path_bytes.len() as u64));
+                ctx.constrain_equal(&key_byte_len_wit, &path_byte_len_wit);
+                
+            }
+            None => {
+                assert!(max_key_byte_len == path_bytes.len());
+            }
+        }
 
+        let key_byte_len = match key_byte_len {
+            Some(key_byte_len) => Some(ctx.load_witness(F::from(key_byte_len as u64))),
+            None => None,
+        };
+        // let key_byte_len = ctx.load_witness(F::from(path_bytes.len() as u64));
         // if slot_is_empty, we make modify key_frag so it still concatenates to `path`
         if slot_is_empty {
             // remove just added leaf frag
             key_frag.pop().unwrap();
             if key_frag.is_empty() {
-                let nibbles = bytes_to_nibbles(path.as_bytes()); // that means proof was empty
-                key_frag = vec![(nibbles, 33, false)];
+                let nibbles = match &path {
+                    PathType::Fixed(fpath) => bytes_to_nibbles(fpath.as_bytes()),
+                    PathType::Var(vpath) => bytes_to_nibbles(&vpath)
+                }; // that means proof was empty
+                key_frag = vec![(nibbles, path_bytes.len() + 1, false)];
             } else {
                 // the last frag in non-inclusion doesn't match path
                 key_frag.pop().unwrap();
@@ -1141,22 +1305,23 @@ impl MPTFixedKeyInput {
                 let mut remaining = path_nibbles[hex_len..].to_vec();
                 let is_odd = remaining.len() % 2 == 1;
                 let byte_len = (remaining.len() + 2 - usize::from(is_odd)) / 2;
-                remaining.resize(2 * key_byte_len, 0);
+                remaining.resize(2 * max_key_byte_len, 0);
                 key_frag.push((remaining, byte_len, is_odd));
             }
         }
-        key_frag.resize(max_depth, (vec![0u8; 2 * key_byte_len], 0, false));
+        key_frag.resize(max_depth, (vec![0u8; 2 * max_key_byte_len], 0, false));
 
         // assign all values
         let value_byte_len = ctx.load_witness(F::from(value.len() as u64));
         let depth = ctx.load_witness(F::from(depth as u64));
         let mut load_bytes =
-            |bytes: &[u8]| ctx.assign_witnesses(bytes.iter().map(|x| F::from(*x as u64)));
-        let key_bytes = load_bytes(path.as_bytes());
+            |bytes: Vec<u8>, ctx: &mut Context<F>| ctx.assign_witnesses(bytes.iter().map(|x| F::from(*x as u64)));
+        path_bytes.resize(max_key_byte_len, 0);
+        let key_bytes = load_bytes(path_bytes, ctx);
         value.resize(value_max_byte_len, 0);
-        let value_bytes = load_bytes(&value);
-        let root_hash_bytes = load_bytes(root_hash.as_bytes());
-        let leaf_bytes = load_bytes(&leaf);
+        let value_bytes = load_bytes((&value).to_vec(), ctx);
+        let root_hash_bytes = load_bytes(root_hash.as_bytes().to_vec(), ctx);
+        let leaf_bytes = load_bytes((&leaf).to_vec(), ctx);
         let nodes = nodes
             .into_iter()
             .map(|(node_bytes, node_type)| {
@@ -1174,20 +1339,20 @@ impl MPTFixedKeyInput {
                 MPTKeyFragment { nibbles, is_odd, byte_len }
             })
             .collect_vec();
-
         let slot_is_empty = ctx.load_witness(F::from(slot_is_empty));
-
-        MPTFixedKeyProof {
+        MPTKeyProof {
             key_bytes,
             value_bytes,
             value_byte_len,
             root_hash_bytes,
+            key_byte_len,
+            depth,
             leaf_bytes,
             nodes,
-            depth,
             key_frag,
-            max_depth,
             slot_is_empty,
+            max_key_byte_len,
+            max_depth,
         }
     }
 }

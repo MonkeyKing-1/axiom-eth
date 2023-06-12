@@ -177,6 +177,8 @@ impl<F: Field> KeccakChip<F> {
             );
         }
         let num_bytes = len.value().get_lower_32() as usize;
+        println!("BYTES: {}", bytes.len());
+        println!("{}", num_bytes);
         debug_assert!(bytes.len() >= num_bytes);
         let output_bytes = keccak256(&bytes[..num_bytes]);
         let output_assigned = ctx.assign_witnesses(

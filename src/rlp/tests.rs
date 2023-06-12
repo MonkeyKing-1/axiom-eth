@@ -188,7 +188,7 @@ mod rlp {
         let inputs = ctx.assign_witnesses(encoded.iter().map(|x| F::from(*x as u64)));
         let range = RangeChip::default(8);
         let chip = RlpChip::new(&range, None);
-        let witness = chip.decompose_rlp_array_phase0(ctx, inputs, max_field_lens, is_var_len);
+        let witness = chip.decompose_rlp_array_phase0(ctx, inputs, max_field_lens, is_var_len, false);
 
         let circuit = RlpCircuitBuilder::new(
             builder,
